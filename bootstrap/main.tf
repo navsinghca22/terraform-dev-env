@@ -23,8 +23,12 @@ terraform {
 }
 
 provider "aws" {
-  region  = var.aws_region
-  profile = var.aws_profile
+  region = var.aws_region
+
+  # Empty means "use the default credential chain" -- env vars, the default
+  # profile, or an instance/container role. Set a name only if you actually
+  # use a named profile.
+  profile = var.aws_profile != "" ? var.aws_profile : null
 }
 
 data "aws_caller_identity" "current" {}
