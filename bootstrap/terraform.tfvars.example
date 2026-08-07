@@ -1,0 +1,28 @@
+# Copy to terraform.tfvars and edit. Run once, locally.
+
+aws_region  = "us-east-1"
+aws_profile = "vscode"
+
+# --- CLASSIC sub claims (repos created before 15 July 2026) ---
+plan_sub_patterns = [
+  "repo:YOUR-ORG/YOUR-REPO:pull_request",
+  "repo:YOUR-ORG/YOUR-REPO:ref:refs/heads/main",
+]
+
+apply_sub_patterns = [
+  "repo:YOUR-ORG/YOUR-REPO:environment:dev",
+]
+
+# --- IMMUTABLE sub claims (repos created on/after 15 July 2026) ---
+# Get the IDs with: gh api /repos/ORG/REPO --jq '{repo: .id, org: .owner.id}'
+#
+# plan_sub_patterns = [
+#   "repo:YOUR-ORG@1234567/YOUR-REPO@7654321:pull_request",
+#   "repo:YOUR-ORG@1234567/YOUR-REPO@7654321:ref:refs/heads/main",
+# ]
+#
+# apply_sub_patterns = [
+#   "repo:YOUR-ORG@1234567/YOUR-REPO@7654321:environment:dev",
+# ]
+#
+# Not sure which applies? List both forms. Each is still pinned to your repo.

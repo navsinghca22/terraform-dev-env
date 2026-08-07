@@ -1,0 +1,28 @@
+# Optional, for LOCAL runs only. Copy to terraform.tfvars (gitignored).
+#
+# CI does not use this file -- it passes -var-file=dev.tfvars plus the
+# SSH_PUBLIC_KEY repository variable. Anything you put here is for your
+# machine alone.
+
+aws_region  = "us-east-1"
+aws_profile = "vscode" # leave "" in CI so OIDC env credentials are used
+
+# Write an entry into your local ~/.ssh/config after apply.
+write_local_ssh_config = true
+host_os                = "linux" # or "windows"
+ssh_private_key_path   = "~/.ssh/mtckey"
+
+instance_type    = "t3.micro"
+root_volume_size = 10
+
+# ssh_public_key has no default and cannot usefully live in a .tfvars file
+# (it is the key contents, not a path). Pass it on the command line:
+#
+#   terraform apply \
+#     -var-file=dev.tfvars \
+#     -var="ssh_public_key=$(cat ~/.ssh/mtckey.pub)" \
+#     -var="write_local_ssh_config=true"
+#
+# Reminder: SSH ingress is owned by the domain-security stack now. Add your
+# address to domain-security/dev.tfvars (allowed_cidrs) and apply that stack,
+# or you will not be able to connect.

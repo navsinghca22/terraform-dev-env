@@ -1,0 +1,277 @@
+name: Terraform Dev
+
+# NOTE: the paths list is duplicated on purpose. GitHub Actions does not
+# support YAML anchors/aliases -- a workflow using &anchor / *alias is
+# rejected by the parser, even though it is valid YAML.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "domain-security/**"
+      - ".github/workflows/terraform-dev.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "domain-security/**"
+      - ".github/workflows/terraform-dev.yml"
+  workflow_dispatch:
+
+# Never let two runs touch the same state at once. S3-native locking would
+# make the second one fail anyway -- this makes it queue instead.
+concurrency:
+  group: terraform-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # =========================================================================
+  # TF Plan - Dev
+  # =========================================================================
+  plan:
+    name: TF Plan - Dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # required to mint the OIDC token
+      pull-requests: write   # required to post the plan as a PR comment
+    outputs:
+      exitcode: ${{ steps.plan.outputs.exitcode }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform fmt (whole repo)
+        run: terraform fmt -check -recursive .
+
+      - name: Configure AWS credentials (plan role, read-only)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gha-plan-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Terraform validate
+        working-directory: infra
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        working-directory: infra
+        # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+        # Without it, "plan failed" and "plan found nothing" look identical
+        # to every later step.
+        run: |
+          set +e
+          terraform plan -no-color \
+            -var-file=dev.tfvars \
+            -var="ssh_public_key=${{ vars.SSH_PUBLIC_KEY }}" \
+            -out=tfplan \
+            -detailed-exitcode
+          code=$?
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::terraform plan failed"
+          exit 1
+
+      - name: Render plan to text
+        working-directory: infra
+        run: terraform show -no-color tfplan > plan.txt
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # A plan file can contain sensitive attribute values in plaintext.
+          # Keep retention short and the repository private.
+          name: tfplan-infra
+          path: |
+            infra/tfplan
+            infra/plan.txt
+          retention-days: 5
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          status="No changes"
+          [ "$EXITCODE" = "2" ] && status="Changes detected"
+          {
+            echo "### TF Plan - Dev: $status"
+            echo
+            echo "<details><summary>Show plan</summary>"
+            echo
+            echo '```terraform'
+            # GitHub rejects comments over ~65k characters.
+            head -c 60000 infra/plan.txt
+            echo
+            echo '```'
+            echo
+            echo "</details>"
+          } > comment.md
+          gh pr comment "${{ github.event.number }}" --body-file comment.md
+
+  # =========================================================================
+  # TF Apply - Dev
+  #
+  # Gated by the "dev" GitHub Environment. Two things follow from that:
+  #   - the job pauses until a required reviewer approves
+  #   - the OIDC token's sub becomes repo:ORG/REPO:environment:dev, which is
+  #     the only sub the apply role's trust policy accepts
+  # So the approval is enforced by AWS, not merely by GitHub's UI.
+  # =========================================================================
+  apply:
+    name: TF Apply - Dev
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (apply role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-apply-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download the reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-infra
+          path: infra
+
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Terraform apply
+        working-directory: infra
+        # Applying the SAVED plan, not re-planning. What runs is exactly what
+        # was reviewed. No -auto-approve is needed: a saved plan file is
+        # already an approval.
+        run: terraform apply -no-color tfplan
+
+      - name: Summary
+        working-directory: infra
+        run: |
+          {
+            echo "### TF Apply - Dev"
+            echo
+            echo "| Output | Value |"
+            echo "|---|---|"
+            echo "| Instance IP | \`$(terraform output -raw dev_ip)\` |"
+            echo "| Instance ID | \`$(terraform output -raw instance_id)\` |"
+            echo "| AMI | \`$(terraform output -raw ami_id)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =========================================================================
+  # TF - Update Domain-Security - Dev
+  #
+  # Runs after apply because it reads the infra stack's state for the new IP.
+  # Also runnable alone via workflow_dispatch, to refresh the SSH allowlist
+  # when an allowlisted hostname changes address -- no instance change needed.
+  # =========================================================================
+  domain-security:
+    name: TF - Update Domain-Security - Dev
+    needs: apply
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (apply role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-domsec-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: domain-security
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Terraform plan
+        working-directory: domain-security
+        run: |
+          terraform plan -no-color \
+            -var-file=dev.tfvars \
+            -var="state_bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -out=tfplan
+
+      - name: Show the firewall change before making it
+        working-directory: domain-security
+        run: |
+          {
+            echo "### TF - Update Domain-Security - Dev"
+            echo
+            echo '```terraform'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        working-directory: domain-security
+        run: terraform apply -no-color tfplan
+
+      - name: Report allowlist
+        working-directory: domain-security
+        run: |
+          {
+            echo
+            echo "**SSH allowlist now in effect** ($(terraform output -raw rule_count) rules):"
+            echo
+            echo '```json'
+            terraform output -json allowlisted_cidrs
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
