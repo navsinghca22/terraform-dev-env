@@ -1,0 +1,168 @@
+name: Terraform Destroy - Dev
+
+# Manual dispatch ONLY. There is deliberately no push or schedule trigger --
+# nothing should ever be able to destroy infrastructure automatically.
+#
+# Three safety layers:
+#   1. you must type the confirmation string exactly
+#   2. the "dev" environment gate requires a human approval
+#   3. the destroy plan is printed to the job summary before anything runs
+#
+# This never touches bootstrap/ -- the state bucket and CI roles are not
+# managed here, and the bucket has prevent_destroy set anyway.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy-dev" to confirm'
+        required: true
+        type: string
+
+concurrency:
+  group: terraform-dev        # same group as the apply pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # =========================================================================
+  # Refuse early and cheaply if the confirmation is wrong, before we assume
+  # any AWS role at all.
+  # =========================================================================
+  confirm:
+    name: Confirm intent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation string
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "destroy-dev" ]; then
+            echo "::error::Confirmation failed. Expected 'destroy-dev', got '$CONFIRM'."
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+  # =========================================================================
+  # Destroy in REVERSE dependency order.
+  #
+  # domain-security reads infra's state via terraform_remote_state and its
+  # rules attach to infra's security group. Destroying infra first would
+  # leave this stack unable to resolve its own data source.
+  # =========================================================================
+  destroy-domain-security:
+    name: Destroy Domain-Security - Dev
+    needs: confirm
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-destroy-domsec-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: domain-security
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Plan destroy
+        working-directory: domain-security
+        run: |
+          terraform plan -destroy -no-color \
+            -var-file=dev.tfvars \
+            -var="state_bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -out=tfdestroy
+          {
+            echo "### Destroy plan - domain-security"
+            echo
+            echo '```terraform'
+            terraform show -no-color tfdestroy
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply destroy
+        working-directory: domain-security
+        run: terraform apply -no-color tfdestroy
+
+  destroy-infra:
+    name: Destroy Infra - Dev
+    needs: destroy-domain-security
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gha-destroy-infra-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Plan destroy
+        working-directory: infra
+        # ssh_public_key has no default, so it must still be supplied even
+        # for a destroy -- Terraform evaluates all variables regardless.
+        run: |
+          terraform plan -destroy -no-color \
+            -var-file=dev.tfvars \
+            -var="ssh_public_key=${{ vars.SSH_PUBLIC_KEY }}" \
+            -out=tfdestroy
+          {
+            echo "### Destroy plan - infra"
+            echo
+            echo '```terraform'
+            terraform show -no-color tfdestroy
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply destroy
+        working-directory: infra
+        run: terraform apply -no-color tfdestroy
+
+      - name: Confirm empty
+        working-directory: infra
+        run: |
+          remaining=$(terraform state list | wc -l | tr -d ' ')
+          {
+            echo
+            echo "**Resources remaining in infra state: \`$remaining\`**"
+            [ "$remaining" = "0" ] && echo && echo "Dev environment fully destroyed. Cost is back to ~\$0."
+          } >> "$GITHUB_STEP_SUMMARY"
